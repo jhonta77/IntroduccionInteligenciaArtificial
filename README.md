@@ -22,7 +22,8 @@ La sección de X queda disponible, pero cada persona debe usar su propio token s
 .
 ├── fondo.py
 ├── movimientos_acciones.csv
-├── streamlit_app.py
+├── streamlit_acciones_jhon.py
+├── celsia_app.py
 ├── x_cuentas_monitoreadas.csv
 ├── requirements.txt
 └── README.md
@@ -37,13 +38,19 @@ La sección de X queda disponible, pero cada persona debe usar su propio token s
    pip install -r requirements.txt
    ```
 
-3. Ejecutar la app:
+3. Ejecutar la app de acciones:
 
    ```bash
-   streamlit run streamlit_app.py
+   streamlit run streamlit_acciones_jhon.py
    ```
 
-4. Opcionalmente, para refrescar noticias de X en vivo:
+4. Ejecutar la app de Celsia:
+
+   ```bash
+   streamlit run celsia_app.py
+   ```
+
+5. Opcionalmente, para refrescar noticias de X en vivo:
 
    ```bash
    copy .env.example .env

@@ -1,5 +1,6 @@
 import io
 import os
+import random
 from pathlib import Path
 
 import altair as alt
@@ -28,6 +29,8 @@ TICKERS_YFINANCE = {
     "IBITCO": "IBITCO.CL",
 }
 ACCIONES_COLOMBIANAS = ["ECOPETROL", "MINEROS", "NUCO", "PFCIBEST"]
+TICKER_PETROLEO_BRENT = "BZ=F"
+TICKER_CELSIA = "CELSIA.CL"
 
 
 def cargar_env_local():
@@ -541,6 +544,173 @@ def descargar_historicos_yfinance(tickers_por_accion, fechas_inicio):
     return historico_df, precios_df, errores
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def descargar_historico_referencia_yfinance(ticker, fecha_inicio):
+    if yf is None:
+        raise RuntimeError("yfinance no esta instalado en el entorno.")
+
+    datos = yf.Ticker(str(ticker).strip().upper()).history(
+        start=pd.to_datetime(fecha_inicio).date().isoformat(),
+        auto_adjust=False,
+    )
+    if datos.empty or "Close" not in datos:
+        return pd.DataFrame()
+
+    datos = datos.reset_index()
+    columna_fecha = "Date" if "Date" in datos.columns else datos.columns[0]
+    fechas = pd.to_datetime(datos[columna_fecha])
+    if fechas.dt.tz is not None:
+        fechas = fechas.dt.tz_convert(None)
+    datos["Fecha"] = fechas
+    datos = datos.dropna(subset=["Close"])
+    return datos[["Fecha", "Close"]].rename(columns={"Close": "Precio petroleo"})
+
+
+def construir_regresion_lineal_ecopetrol_petroleo(historico_df, historico_petroleo):
+    ecopetrol = historico_df[historico_df["Accion"] == "ECOPETROL"][
+        ["Fecha", "Close"]
+    ].rename(columns={"Close": "Precio ECOPETROL"})
+    if ecopetrol.empty or historico_petroleo.empty:
+        return pd.DataFrame(), {}
+
+    datos = ecopetrol.merge(historico_petroleo, on="Fecha", how="inner").dropna()
+    if len(datos) < 2:
+        return datos, {}
+
+    x = datos["Precio petroleo"]
+    y = datos["Precio ECOPETROL"]
+    pendiente = x.cov(y) / x.var() if x.var() else 0.0
+    intercepto = y.mean() - pendiente * x.mean()
+    datos["Precio estimado ECOPETROL"] = intercepto + pendiente * x
+
+    ss_res = ((y - datos["Precio estimado ECOPETROL"]) ** 2).sum()
+    ss_tot = ((y - y.mean()) ** 2).sum()
+    r2 = 1 - (ss_res / ss_tot) if ss_tot else 0.0
+    correlacion = x.corr(y)
+
+    return datos, {
+        "pendiente": float(pendiente),
+        "intercepto": float(intercepto),
+        "r2": float(r2),
+        "correlacion": float(correlacion),
+        "observaciones": int(len(datos)),
+    }
+
+
+def grafico_regresion_ecopetrol_petroleo(datos_regresion):
+    margen_x = max(
+        (datos_regresion["Precio petroleo"].max() - datos_regresion["Precio petroleo"].min())
+        * 0.08,
+        1,
+    )
+    margen_y = max(
+        (datos_regresion["Precio ECOPETROL"].max() - datos_regresion["Precio ECOPETROL"].min())
+        * 0.08,
+        1,
+    )
+    dominio_x = [
+        float(datos_regresion["Precio petroleo"].min() - margen_x),
+        float(datos_regresion["Precio petroleo"].max() + margen_x),
+    ]
+    dominio_y = [
+        float(datos_regresion["Precio ECOPETROL"].min() - margen_y),
+        float(datos_regresion["Precio ECOPETROL"].max() + margen_y),
+    ]
+    puntos = (
+        alt.Chart(datos_regresion)
+        .mark_circle(size=80, opacity=0.72, color="#0f766e")
+        .encode(
+            x=alt.X(
+                "Precio petroleo:Q",
+                title="Precio Brent",
+                scale=alt.Scale(domain=dominio_x, zero=False),
+            ),
+            y=alt.Y(
+                "Precio ECOPETROL:Q",
+                title="Precio ECOPETROL",
+                scale=alt.Scale(domain=dominio_y, zero=False),
+            ),
+            tooltip=[
+                alt.Tooltip("Fecha:T", title="Fecha"),
+                alt.Tooltip("Precio petroleo:Q", title="Brent", format=",.2f"),
+                alt.Tooltip("Precio ECOPETROL:Q", title="ECOPETROL", format=",.2f"),
+            ],
+        )
+    )
+    linea = (
+        alt.Chart(datos_regresion.sort_values("Precio petroleo"))
+        .mark_line(color="#a16207", strokeWidth=3)
+        .encode(
+            x=alt.X(
+                "Precio petroleo:Q",
+                scale=alt.Scale(domain=dominio_x, zero=False),
+            ),
+            y=alt.Y(
+                "Precio estimado ECOPETROL:Q",
+                scale=alt.Scale(domain=dominio_y, zero=False),
+            ),
+        )
+    )
+    return (puntos + linea).properties(height=360)
+
+
+def grafico_series_ecopetrol_petroleo(datos_regresion):
+    base = datos_regresion[
+        ["Fecha", "Precio ECOPETROL", "Precio petroleo"]
+    ].copy()
+    base["ECOPETROL base 100"] = (
+        base["Precio ECOPETROL"] / base["Precio ECOPETROL"].iloc[0]
+    ) * 100
+    base["Petroleo base 100"] = (
+        base["Precio petroleo"] / base["Precio petroleo"].iloc[0]
+    ) * 100
+    base = base.melt(
+        id_vars=["Fecha"],
+        value_vars=["ECOPETROL base 100", "Petroleo base 100"],
+        var_name="Serie",
+        value_name="Indice base 100",
+    )
+    return (
+        alt.Chart(base)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("Fecha:T", title="Fecha"),
+            y=alt.Y(
+                "Indice base 100:Q",
+                title="Indice base 100",
+                scale=alt.Scale(zero=False),
+            ),
+            color=alt.Color("Serie:N", legend=alt.Legend(title=None)),
+            tooltip=[
+                alt.Tooltip("Fecha:T", title="Fecha"),
+                alt.Tooltip("Serie:N", title="Serie"),
+                alt.Tooltip("Indice base 100:Q", title="Indice", format=",.2f"),
+            ],
+        )
+        .properties(height=300)
+    )
+
+
+def interpretar_correlacion(valor):
+    valor_abs = abs(valor)
+    if valor_abs >= 0.8:
+        fuerza = "fuerte"
+    elif valor_abs >= 0.5:
+        fuerza = "moderada"
+    elif valor_abs >= 0.2:
+        fuerza = "debil"
+    else:
+        fuerza = "muy debil"
+
+    if valor > 0:
+        direccion = "positiva"
+    elif valor < 0:
+        direccion = "negativa"
+    else:
+        direccion = "nula"
+    return f"Correlacion {direccion} {fuerza}"
+
+
 def grafico_historico_precios(historico_df):
     return (
         alt.Chart(historico_df)
@@ -1044,6 +1214,985 @@ def convertir_df_a_csv(df):
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def plantilla_celsia_energia_solar():
+    return pd.DataFrame(
+        columns=[
+            "fecha",
+            "precio_celsia",
+            "capacidad_solar_mw",
+            "generacion_solar_gwh",
+            "precio_bolsa_energia",
+        ]
+    )
+
+
+def plantilla_upme_pipeline_solar():
+    return pd.DataFrame(
+        columns=[
+            "fecha_corte",
+            "proyectos_solares_activos",
+            "capacidad_pipeline_solar_mw",
+            "proyectos_fase_1",
+            "proyectos_fase_2",
+            "proyectos_fase_3",
+        ]
+    )
+
+
+def plantilla_tasa_interes():
+    return pd.DataFrame(
+        columns=[
+            "fecha_inicio_vigencia",
+            "tasa_interes",
+        ]
+    )
+
+
+def dividendos_celsia_base():
+    return pd.DataFrame(
+        [
+            {"fecha": pd.Timestamp("2026-04-09"), "dividendo_por_accion": 900.0},
+            {"fecha": pd.Timestamp("2026-07-23"), "dividendo_por_accion": 60.0},
+            {"fecha": pd.Timestamp("2026-10-22"), "dividendo_por_accion": 60.0},
+        ]
+    )
+
+
+def capacidad_solar_instalada_base():
+    return pd.DataFrame(
+        [
+            {"fecha": pd.Timestamp("2019-12-31"), "capacidad_solar_mw": 8.16},
+            {"fecha": pd.Timestamp("2020-12-31"), "capacidad_solar_mw": 40.86},
+            {"fecha": pd.Timestamp("2021-12-31"), "capacidad_solar_mw": 115.52},
+            {"fecha": pd.Timestamp("2024-01-31"), "capacidad_solar_mw": 448.82},
+        ]
+    )
+
+
+def grafico_capacidad_solar_instalada(df):
+    return (
+        alt.Chart(df)
+        .mark_line(point=True, strokeWidth=3, color="#a16207")
+        .encode(
+            x=alt.X("fecha:T", title="Fecha"),
+            y=alt.Y("capacidad_solar_mw:Q", title="Capacidad solar instalada (MW)"),
+            tooltip=[
+                alt.Tooltip("fecha:T", title="Fecha"),
+                alt.Tooltip("capacidad_solar_mw:Q", title="MW solares", format=",.2f"),
+            ],
+        )
+        .properties(height=320)
+    )
+
+
+def xm_post(endpoint, payload):
+    respuesta = requests.post(
+        f"https://servapibi.xm.com.co/{endpoint}",
+        json=payload,
+        timeout=60,
+    )
+    if not respuesta.ok:
+        raise RuntimeError(f"XM API {respuesta.status_code}: {respuesta.text}")
+    return respuesta.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def descargar_precio_bolsa_xm(fecha_inicio, fecha_fin):
+    inicio = pd.to_datetime(fecha_inicio).normalize()
+    fin = pd.to_datetime(fecha_fin).normalize()
+    filas = []
+    actual = inicio
+    while actual <= fin:
+        cierre = min(actual + pd.Timedelta(days=29), fin)
+        data = xm_post(
+            "hourly",
+            {
+                "MetricId": "PrecBolsNaci",
+                "StartDate": actual.date().isoformat(),
+                "EndDate": cierre.date().isoformat(),
+                "Entity": "Sistema",
+            },
+        )
+        for item in data.get("Items", []):
+            valores = item["HourlyEntities"][0]["Values"]
+            horas = [
+                float(valor)
+                for clave, valor in valores.items()
+                if clave.startswith("Hour") and valor not in ("", None)
+            ]
+            if horas:
+                filas.append(
+                    {
+                        "fecha": pd.to_datetime(item["Date"]),
+                        "precio_bolsa_energia": sum(horas) / len(horas),
+                    }
+                )
+        actual = cierre + pd.Timedelta(days=1)
+    return pd.DataFrame(filas).sort_values("fecha")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def descargar_recursos_solares_xm():
+    data = xm_post("lists", {"MetricId": "ListadoRecursos"})
+    filas = [item["ListEntities"][0]["Values"] for item in data.get("Items", [])]
+    recursos = pd.DataFrame(filas)
+    if recursos.empty:
+        return recursos
+    recursos = recursos[
+        (recursos["EnerSource"] == "RAD SOLAR")
+        & (recursos["State"] == "OPERACION")
+    ].copy()
+    recursos["OperStartdate"] = pd.to_datetime(recursos["OperStartdate"], errors="coerce")
+    return recursos.sort_values(["OperStartdate", "Name"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def descargar_generacion_solar_xm(fecha_inicio, fecha_fin):
+    recursos = descargar_recursos_solares_xm()
+    recursos_normales = recursos[recursos["RecType"] == "NORMAL"].copy()
+    if recursos_normales.empty:
+        return pd.DataFrame()
+
+    codigos = recursos_normales["Code"].dropna().astype(str).tolist()
+    inicio = pd.to_datetime(fecha_inicio).normalize()
+    fin = pd.to_datetime(fecha_fin).normalize()
+    filas = []
+    actual = inicio
+    while actual <= fin:
+        cierre = min(actual + pd.Timedelta(days=29), fin)
+        data = xm_post(
+            "hourly",
+            {
+                "MetricId": "Gene",
+                "StartDate": actual.date().isoformat(),
+                "EndDate": cierre.date().isoformat(),
+                "Entity": "Recurso",
+                "Filter": codigos,
+            },
+        )
+        for item in data.get("Items", []):
+            fecha = pd.to_datetime(item["Date"])
+            for entidad in item.get("HourlyEntities", []):
+                valores = entidad["Values"]
+                generacion_kwh = sum(
+                    float(valor)
+                    for clave, valor in valores.items()
+                    if clave.startswith("Hour") and valor not in ("", None)
+                )
+                filas.append(
+                    {
+                        "fecha": fecha,
+                        "recurso": valores.get("code", ""),
+                        "generacion_kwh": generacion_kwh,
+                    }
+                )
+        actual = cierre + pd.Timedelta(days=1)
+
+    if not filas:
+        return pd.DataFrame()
+    generacion = pd.DataFrame(filas)
+    return (
+        generacion.groupby("fecha", as_index=False)["generacion_kwh"]
+        .sum()
+        .assign(generacion_solar_gwh=lambda df: df["generacion_kwh"] / 1_000_000)
+        .drop(columns=["generacion_kwh"])
+        .sort_values("fecha")
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def descargar_demanda_energia_xm(fecha_inicio, fecha_fin):
+    inicio = pd.to_datetime(fecha_inicio).normalize()
+    fin = pd.to_datetime(fecha_fin).normalize()
+    filas = []
+    actual = inicio
+    while actual <= fin:
+        cierre = min(actual + pd.Timedelta(days=29), fin)
+        data = xm_post(
+            "hourly",
+            {
+                "MetricId": "DemaReal",
+                "StartDate": actual.date().isoformat(),
+                "EndDate": cierre.date().isoformat(),
+                "Entity": "Sistema",
+            },
+        )
+        for item in data.get("Items", []):
+            valores = item["HourlyEntities"][0]["Values"]
+            demanda_kwh = sum(
+                float(valor)
+                for clave, valor in valores.items()
+                if clave.startswith("Hour") and valor not in ("", None)
+            )
+            filas.append(
+                {
+                    "fecha": pd.to_datetime(item["Date"]),
+                    "demanda_energia_gwh": demanda_kwh / 1_000_000,
+                }
+            )
+        actual = cierre + pd.Timedelta(days=1)
+    return pd.DataFrame(filas).sort_values("fecha")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def descargar_generacion_hidraulica_xm(fecha_inicio, fecha_fin):
+    data = xm_post("lists", {"MetricId": "ListadoRecursos"})
+    recursos = pd.DataFrame(
+        [item["ListEntities"][0]["Values"] for item in data.get("Items", [])]
+    )
+    recursos_hidraulicos = recursos[
+        (recursos["EnerSource"] == "AGUA")
+        & (recursos["State"] == "OPERACION")
+        & (recursos["RecType"] == "NORMAL")
+    ].copy()
+    if recursos_hidraulicos.empty:
+        return pd.DataFrame()
+    codigos = recursos_hidraulicos["Code"].dropna().astype(str).tolist()
+    inicio = pd.to_datetime(fecha_inicio).normalize()
+    fin = pd.to_datetime(fecha_fin).normalize()
+    filas = []
+    actual = inicio
+    while actual <= fin:
+        cierre = min(actual + pd.Timedelta(days=29), fin)
+        data = xm_post(
+            "hourly",
+            {
+                "MetricId": "Gene",
+                "StartDate": actual.date().isoformat(),
+                "EndDate": cierre.date().isoformat(),
+                "Entity": "Recurso",
+                "Filter": codigos,
+            },
+        )
+        for item in data.get("Items", []):
+            fecha = pd.to_datetime(item["Date"])
+            total_kwh = 0.0
+            for entidad in item.get("HourlyEntities", []):
+                valores = entidad["Values"]
+                total_kwh += sum(
+                    float(valor)
+                    for clave, valor in valores.items()
+                    if clave.startswith("Hour") and valor not in ("", None)
+                )
+            filas.append(
+                {
+                    "fecha": fecha,
+                    "generacion_hidraulica_gwh": total_kwh / 1_000_000,
+                }
+            )
+        actual = cierre + pd.Timedelta(days=1)
+    return pd.DataFrame(filas).sort_values("fecha")
+
+
+def grafico_precio_bolsa_xm(df):
+    return (
+        alt.Chart(df)
+        .mark_line(strokeWidth=2, color="#0f766e")
+        .encode(
+            x=alt.X("fecha:T", title="Fecha"),
+            y=alt.Y(
+                "precio_bolsa_energia:Q",
+                title="Precio promedio bolsa (COP/kWh)",
+                scale=alt.Scale(zero=False),
+            ),
+            tooltip=[
+                alt.Tooltip("fecha:T", title="Fecha"),
+                alt.Tooltip(
+                    "precio_bolsa_energia:Q",
+                    title="Precio bolsa",
+                    format=",.2f",
+                ),
+            ],
+        )
+        .properties(height=300)
+    )
+
+
+def grafico_generacion_solar_xm(df):
+    return (
+        alt.Chart(df)
+        .mark_area(opacity=0.75, color="#a16207")
+        .encode(
+            x=alt.X("fecha:T", title="Fecha"),
+            y=alt.Y(
+                "generacion_solar_gwh:Q",
+                title="Generacion solar (GWh/dia)",
+            ),
+            tooltip=[
+                alt.Tooltip("fecha:T", title="Fecha"),
+                alt.Tooltip(
+                    "generacion_solar_gwh:Q",
+                    title="Generacion solar",
+                    format=",.4f",
+                ),
+            ],
+        )
+        .properties(height=300)
+    )
+
+
+def construir_dataset_modelo_celsia(
+    historico_celsia,
+    precio_bolsa,
+    generacion_solar,
+    demanda_energia=None,
+    generacion_hidraulica=None,
+    tasa_interes=None,
+    dividendos=None,
+):
+    if historico_celsia.empty or precio_bolsa.empty or generacion_solar.empty:
+        return pd.DataFrame()
+    precios = historico_celsia.rename(columns={"Fecha": "fecha"}).copy()
+    precios["fecha"] = pd.to_datetime(precios["fecha"]).dt.normalize()
+    bolsa = precio_bolsa.copy()
+    bolsa["fecha"] = pd.to_datetime(bolsa["fecha"]).dt.normalize()
+    solar = generacion_solar.copy()
+    solar["fecha"] = pd.to_datetime(solar["fecha"]).dt.normalize()
+    dataset = (
+        precios.merge(bolsa, on="fecha", how="inner")
+        .merge(solar, on="fecha", how="inner")
+        .dropna()
+        .sort_values("fecha")
+    )
+    if demanda_energia is not None and not demanda_energia.empty:
+        demanda = demanda_energia.copy()
+        demanda["fecha"] = pd.to_datetime(demanda["fecha"]).dt.normalize()
+        dataset = dataset.merge(demanda, on="fecha", how="inner")
+    if generacion_hidraulica is not None and not generacion_hidraulica.empty:
+        hidraulica = generacion_hidraulica.copy()
+        hidraulica["fecha"] = pd.to_datetime(hidraulica["fecha"]).dt.normalize()
+        dataset = dataset.merge(hidraulica, on="fecha", how="inner")
+    if tasa_interes is not None and not tasa_interes.empty:
+        tasas = tasa_interes.copy()
+        tasas["fecha_inicio_vigencia"] = pd.to_datetime(
+            tasas["fecha_inicio_vigencia"]
+        ).astype("datetime64[ns]")
+        dataset["fecha"] = pd.to_datetime(dataset["fecha"]).astype("datetime64[ns]")
+        dataset = pd.merge_asof(
+            dataset.sort_values("fecha"),
+            tasas.sort_values("fecha_inicio_vigencia"),
+            left_on="fecha",
+            right_on="fecha_inicio_vigencia",
+            direction="backward",
+        )
+    if dividendos is not None and not dividendos.empty:
+        div = dividendos.copy()
+        div["fecha"] = pd.to_datetime(div["fecha"]).dt.normalize()
+        div["evento_dividendo"] = 1
+        dataset = dataset.merge(
+            div[["fecha", "dividendo_por_accion", "evento_dividendo"]],
+            on="fecha",
+            how="left",
+        )
+        dataset["dividendo_por_accion"] = dataset["dividendo_por_accion"].fillna(0)
+        dataset["evento_dividendo"] = dataset["evento_dividendo"].fillna(0)
+    return dataset.dropna().sort_values("fecha")
+
+
+def ajustar_modelo_lineal_celsia(dataset):
+    if len(dataset) < 3:
+        return dataset.copy(), {}
+    base = dataset.copy()
+    variables = [
+        col
+        for col in [
+            "precio_bolsa_energia",
+            "generacion_solar_gwh",
+            "demanda_energia_gwh",
+            "generacion_hidraulica_gwh",
+            "tasa_interes",
+            "dividendo_por_accion",
+            "evento_dividendo",
+        ]
+        if col in base.columns
+    ]
+    x = base[variables].astype(float)
+    x_design = pd.concat(
+        [pd.Series(1.0, index=base.index, name="intercepto"), x],
+        axis=1,
+    )
+    y = base["Precio Celsia"].astype(float)
+    import numpy as np
+
+    beta_vals, *_ = np.linalg.lstsq(x_design.to_numpy(), y.to_numpy(), rcond=None)
+    base["Precio estimado Celsia"] = x_design.to_numpy() @ beta_vals
+    residuales = y - base["Precio estimado Celsia"]
+    ss_res = (residuales**2).sum()
+    ss_tot = ((y - y.mean()) ** 2).sum()
+    r2 = 1 - (ss_res / ss_tot) if ss_tot else 0.0
+    mae = residuales.abs().mean()
+    rmse = float((residuales.pow(2).mean()) ** 0.5)
+    return base, {
+        "intercepto": float(beta_vals[0]),
+        "coeficientes": {
+            variable: float(coeficiente)
+            for variable, coeficiente in zip(x_design.columns, beta_vals)
+        },
+        "r2": float(r2),
+        "mae": float(mae),
+        "rmse": rmse,
+        "observaciones": int(len(base)),
+    }
+
+
+def separar_entrenamiento_prueba_celsia(dataset, proporcion_prueba=0.2):
+    if dataset.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    punto_corte = max(int(len(dataset) * (1 - proporcion_prueba)), 1)
+    entrenamiento = dataset.iloc[:punto_corte].copy()
+    prueba = dataset.iloc[punto_corte:].copy()
+    return entrenamiento, prueba
+
+
+def aplicar_modelo_celsia(dataset, metricas_modelo):
+    if dataset.empty or not metricas_modelo:
+        return dataset.copy()
+    base = dataset.copy()
+    valores = pd.Series(
+        metricas_modelo["coeficientes"]["intercepto"],
+        index=base.index,
+        dtype="float64",
+    )
+    for variable, coeficiente in metricas_modelo["coeficientes"].items():
+        if variable == "intercepto" or variable not in base:
+            continue
+        valores += base[variable].astype(float) * coeficiente
+    base["Precio estimado Celsia"] = valores
+    return base
+
+
+def evaluar_modelo_celsia(dataset):
+    if dataset.empty or "Precio estimado Celsia" not in dataset:
+        return {}
+    errores = dataset["Precio Celsia"] - dataset["Precio estimado Celsia"]
+    ss_res = (errores**2).sum()
+    ss_tot = ((dataset["Precio Celsia"] - dataset["Precio Celsia"].mean()) ** 2).sum()
+    return {
+        "observaciones": int(len(dataset)),
+        "r2": float(1 - (ss_res / ss_tot)) if ss_tot else 0.0,
+        "mae": float(errores.abs().mean()),
+        "rmse": float((errores.pow(2).mean()) ** 0.5),
+    }
+
+
+def proyectar_precio_celsia(metricas_modelo, valores_variables):
+    if not metricas_modelo:
+        return None
+    total = metricas_modelo["coeficientes"]["intercepto"]
+    for variable, valor in valores_variables.items():
+        total += metricas_modelo["coeficientes"].get(variable, 0.0) * float(valor)
+    return total
+
+
+def grafico_precio_real_vs_estimado_celsia(dataset_modelo):
+    base = dataset_modelo[
+        ["fecha", "Precio Celsia", "Precio estimado Celsia"]
+    ].melt(
+        id_vars=["fecha"],
+        value_vars=["Precio Celsia", "Precio estimado Celsia"],
+        var_name="Serie",
+        value_name="Precio",
+    )
+    return (
+        alt.Chart(base)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("fecha:T", title="Fecha"),
+            y=alt.Y("Precio:Q", title="Precio Celsia", scale=alt.Scale(zero=False)),
+            color=alt.Color("Serie:N", legend=alt.Legend(title=None)),
+            tooltip=[
+                alt.Tooltip("fecha:T", title="Fecha"),
+                alt.Tooltip("Serie:N", title="Serie"),
+                alt.Tooltip("Precio:Q", title="Precio", format=",.2f"),
+            ],
+        )
+        .properties(height=320)
+    )
+
+
+def cargar_dataset_celsia(archivo_subido):
+    if archivo_subido is None:
+        return pd.DataFrame()
+    nombre = archivo_subido.name.lower()
+    if nombre.endswith(".csv"):
+        df = pd.read_csv(archivo_subido)
+    else:
+        df = pd.read_excel(archivo_subido)
+    columnas_requeridas = set(plantilla_celsia_energia_solar().columns)
+    faltantes = columnas_requeridas.difference(df.columns)
+    if faltantes:
+        raise ValueError(
+            "Faltan columnas requeridas para Celsia: " + ", ".join(sorted(faltantes))
+        )
+    df = df.copy()
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    return df.sort_values("fecha")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def descargar_historico_celsia(fecha_inicio, fecha_fin):
+    if yf is None:
+        raise RuntimeError("yfinance no esta instalado en el entorno.")
+    datos = yf.Ticker(TICKER_CELSIA).history(
+        start=pd.to_datetime(fecha_inicio).date().isoformat(),
+        end=(pd.to_datetime(fecha_fin) + pd.Timedelta(days=1)).date().isoformat(),
+        auto_adjust=False,
+    )
+    if datos.empty or "Close" not in datos:
+        return pd.DataFrame()
+    datos = datos.reset_index()
+    columna_fecha = "Date" if "Date" in datos.columns else datos.columns[0]
+    fechas = pd.to_datetime(datos[columna_fecha])
+    if fechas.dt.tz is not None:
+        fechas = fechas.dt.tz_convert(None)
+    datos["Fecha"] = fechas
+    return datos[["Fecha", "Close"]].dropna().rename(columns={"Close": "Precio Celsia"})
+
+
+def simular_compras_celsia(historico, monto_total, numero_compras, semilla):
+    if historico.empty:
+        return pd.DataFrame(), 0.0
+    numero_compras = min(int(numero_compras), len(historico))
+    rng = random.Random(int(semilla))
+    indices = sorted(rng.sample(range(len(historico)), k=numero_compras))
+    pesos = [rng.random() for _ in range(numero_compras)]
+    suma_pesos = sum(pesos)
+    compras = []
+    efectivo_restante = float(monto_total)
+
+    for indice, peso in zip(indices, pesos):
+        fila = historico.iloc[indice]
+        objetivo = float(monto_total) * (peso / suma_pesos)
+        precio = float(fila["Precio Celsia"])
+        cantidad = int(objetivo // precio)
+        invertido = cantidad * precio
+        efectivo_restante -= invertido
+        compras.append(
+            {
+                "Fecha": fila["Fecha"],
+                "Precio unidad": precio,
+                "Cantidad": cantidad,
+                "Monto objetivo": objetivo,
+                "Monto invertido": invertido,
+            }
+        )
+
+    compras_df = pd.DataFrame(compras)
+    return compras_df, efectivo_restante
+
+
+def grafico_celsia_con_compras(historico, compras):
+    linea = (
+        alt.Chart(historico)
+        .mark_line(strokeWidth=3, color="#0f766e")
+        .encode(
+            x=alt.X("Fecha:T", title="Fecha"),
+            y=alt.Y("Precio Celsia:Q", title="Precio Celsia", scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("Fecha:T", title="Fecha"),
+                alt.Tooltip("Precio Celsia:Q", title="Precio", format=",.2f"),
+            ],
+        )
+    )
+    if compras.empty:
+        return linea.properties(height=340)
+    puntos = (
+        alt.Chart(compras)
+        .mark_point(size=130, filled=True, shape="diamond", color="#a16207")
+        .encode(
+            x="Fecha:T",
+            y=alt.Y("Precio unidad:Q"),
+            tooltip=[
+                alt.Tooltip("Fecha:T", title="Fecha compra"),
+                alt.Tooltip("Precio unidad:Q", title="Precio", format=",.2f"),
+                alt.Tooltip("Cantidad:Q", title="Acciones"),
+                alt.Tooltip("Monto invertido:Q", title="Invertido", format=",.2f"),
+            ],
+        )
+    )
+    return (linea + puntos).properties(height=340)
+
+
+def grafico_celsia_variables(df):
+    base = df.melt(
+        id_vars=["fecha"],
+        value_vars=[
+            "precio_celsia",
+            "capacidad_solar_mw",
+            "generacion_solar_gwh",
+            "precio_bolsa_energia",
+        ],
+        var_name="Variable",
+        value_name="Valor",
+    )
+    return (
+        alt.Chart(base)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("fecha:T", title="Fecha"),
+            y=alt.Y("Valor:Q", title="Valor", scale=alt.Scale(zero=False)),
+            color=alt.Color("Variable:N", legend=alt.Legend(title=None)),
+            tooltip=[
+                alt.Tooltip("fecha:T", title="Fecha"),
+                alt.Tooltip("Variable:N", title="Variable"),
+                alt.Tooltip("Valor:Q", title="Valor", format=",.2f"),
+            ],
+        )
+        .properties(height=340)
+    )
+
+
+def mostrar_modulo_celsia_energia_solar():
+    st.markdown(
+        """
+        <section class="hero">
+            <div class="hero-kicker">Modulo energetico</div>
+            <h1>Celsia y energia solar</h1>
+            <p>Espacio para estudiar la relacion entre el precio de Celsia y variables del sistema electrico colombiano.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Modelo inicial sugerido: fecha, precio_celsia, capacidad_solar_mw, generacion_solar_gwh y precio_bolsa_energia."
+    )
+
+    with st.sidebar:
+        st.divider()
+        st.header("Celsia y energia solar")
+        archivo_celsia = st.file_uploader(
+            "Sube dataset Celsia",
+            type=["csv", "xlsx"],
+            key="archivo_celsia_energia",
+        )
+        st.download_button(
+            "Descargar plantilla",
+            data=convertir_df_a_csv(plantilla_celsia_energia_solar()),
+            file_name="plantilla_celsia_energia_solar.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        st.download_button(
+            "Descargar plantilla UPME",
+            data=convertir_df_a_csv(plantilla_upme_pipeline_solar()),
+            file_name="plantilla_upme_pipeline_solar.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        st.download_button(
+            "Descargar plantilla tasas",
+            data=convertir_df_a_csv(plantilla_tasa_interes()),
+            file_name="plantilla_tasa_interes.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        st.divider()
+        st.subheader("Simulacion Celsia")
+        fecha_inicio_simulacion = st.date_input(
+            "Inicio compras",
+            value=(pd.Timestamp.today() - pd.DateOffset(months=6)).date(),
+            key="fecha_inicio_celsia",
+        )
+        fecha_fin_simulacion = st.date_input(
+            "Fin compras",
+            value=pd.Timestamp.today().date(),
+            key="fecha_fin_celsia",
+        )
+        monto_simulado = st.number_input(
+            "Monto total COP",
+            min_value=100000,
+            value=2000000,
+            step=100000,
+            key="monto_total_celsia",
+        )
+        numero_compras = st.number_input(
+            "Numero de compras aleatorias",
+            min_value=1,
+            max_value=30,
+            value=8,
+            step=1,
+            key="numero_compras_celsia",
+        )
+        semilla = st.number_input(
+            "Semilla aleatoria",
+            min_value=1,
+            value=42,
+            step=1,
+            key="semilla_celsia",
+        )
+        cargar_xm = st.checkbox(
+            "Cargar datos de XM",
+            value=False,
+            help="Activalo cuando quieras consultar precio de bolsa, demanda y generacion. Reduce el tiempo de inicio.",
+        )
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Variable principal", "capacidad_solar_mw")
+    col2.metric("Variable de mercado", "precio_bolsa_energia")
+    col3.metric("Activo objetivo", "precio_celsia")
+
+    st.subheader("Hipotesis de trabajo")
+    st.write(
+        "Si aumenta la capacidad solar instalada, puede aumentar la oferta de energia; "
+        "eso puede presionar el precio de bolsa y, directa o indirectamente, afectar la accion de Celsia."
+    )
+
+    st.subheader("Variables estrategicas del sector")
+    st.caption(
+        "Estas variables cambian lentamente y sirven mejor para contexto o analisis de mediano plazo, no para explicar el precio diario."
+    )
+    st.markdown(
+        """
+        - **Capacidad solar instalada:** muestra cuanto parque solar ya existe.
+        - **Pipeline UPME:** mide proyectos futuros por cantidad, MW y fase de avance.
+        """
+    )
+
+    st.subheader("Capacidad solar instalada en Colombia")
+    capacidad_base = capacidad_solar_instalada_base()
+    st.caption(
+        "Serie base con cortes oficiales disponibles. La medida correcta es capacidad instalada en MW, no numero de paneles."
+    )
+    st.altair_chart(
+        grafico_capacidad_solar_instalada(capacidad_base),
+        width="stretch",
+    )
+    with st.expander("Ver tabla de capacidad solar instalada"):
+        st.dataframe(capacidad_base, width="stretch", hide_index=True)
+
+    with st.expander("Ver estructura esperada de datos y pipeline UPME"):
+        st.subheader("Dataset Celsia")
+        st.dataframe(plantilla_celsia_energia_solar(), width="stretch", hide_index=True)
+        st.subheader("Pipeline solar UPME")
+        st.caption(
+            "Plantilla mensual para construir variables de expectativa futura desde los informes de registros activos publicados por UPME."
+        )
+        st.dataframe(plantilla_upme_pipeline_solar(), width="stretch", hide_index=True)
+
+    precio_bolsa_xm = pd.DataFrame()
+    recursos_solares_xm = pd.DataFrame()
+    generacion_solar_xm = pd.DataFrame()
+    demanda_energia_xm = pd.DataFrame()
+    generacion_hidraulica_xm = pd.DataFrame()
+
+    if cargar_xm:
+        st.subheader("Variables de corto plazo conectadas desde XM")
+        st.caption(
+            "Estas variables cambian con mayor frecuencia y son mas utiles para estudiar movimientos recientes de la accion."
+        )
+        try:
+            precio_bolsa_xm = descargar_precio_bolsa_xm(
+                fecha_inicio_simulacion,
+                fecha_fin_simulacion,
+            )
+            recursos_solares_xm = descargar_recursos_solares_xm()
+            generacion_solar_xm = descargar_generacion_solar_xm(
+                fecha_inicio_simulacion,
+                fecha_fin_simulacion,
+            )
+            demanda_energia_xm = descargar_demanda_energia_xm(
+                fecha_inicio_simulacion,
+                fecha_fin_simulacion,
+            )
+            generacion_hidraulica_xm = descargar_generacion_hidraulica_xm(
+                fecha_inicio_simulacion,
+                fecha_fin_simulacion,
+            )
+        except Exception as error:
+            st.error(f"No se pudo consultar XM: {error}")
+
+        if not precio_bolsa_xm.empty or not generacion_solar_xm.empty:
+            tab_bolsa, tab_solar, tab_demanda, tab_hidraulica, tab_recursos = st.tabs(
+                [
+                    "Precio bolsa",
+                    "Generacion solar",
+                    "Demanda",
+                    "Generacion hidraulica",
+                    "Recursos solares",
+                ]
+            )
+            with tab_bolsa:
+                if precio_bolsa_xm.empty:
+                    st.info("XM no devolvio precio de bolsa para el rango seleccionado.")
+                else:
+                    st.altair_chart(grafico_precio_bolsa_xm(precio_bolsa_xm), width="stretch")
+                    st.dataframe(precio_bolsa_xm, width="stretch", hide_index=True)
+            with tab_solar:
+                if generacion_solar_xm.empty:
+                    st.info("XM no devolvio generacion solar utility-scale para el rango seleccionado.")
+                else:
+                    st.altair_chart(
+                        grafico_generacion_solar_xm(generacion_solar_xm),
+                        width="stretch",
+                    )
+                    st.dataframe(generacion_solar_xm, width="stretch", hide_index=True)
+            with tab_demanda:
+                st.dataframe(demanda_energia_xm, width="stretch", hide_index=True)
+            with tab_hidraulica:
+                st.dataframe(generacion_hidraulica_xm, width="stretch", hide_index=True)
+            with tab_recursos:
+                if not recursos_solares_xm.empty:
+                    s1, s2 = st.columns(2)
+                    s1.metric("Recursos solares operando", f"{len(recursos_solares_xm):,.0f}")
+                    s2.metric(
+                        "Primera operacion solar registrada",
+                        recursos_solares_xm["OperStartdate"].min().strftime("%Y-%m-%d"),
+                    )
+                    st.dataframe(
+                        recursos_solares_xm[["Code", "Name", "CompanyCode", "OperStartdate"]],
+                        width="stretch",
+                        hide_index=True,
+                    )
+    else:
+        st.info("Activa 'Cargar datos de XM' en la barra lateral para consultar variables operativas.")
+
+    st.subheader("Historico bursatil y compras simuladas")
+    try:
+        historico_celsia = descargar_historico_celsia(
+            fecha_inicio_simulacion,
+            fecha_fin_simulacion,
+        )
+    except Exception as error:
+        st.error(str(error))
+        historico_celsia = pd.DataFrame()
+
+    if historico_celsia.empty:
+        st.info("No se encontraron precios historicos de Celsia para el rango seleccionado.")
+    else:
+        compras_celsia, efectivo_restante = simular_compras_celsia(
+            historico_celsia,
+            monto_simulado,
+            numero_compras,
+            semilla,
+        )
+        total_invertido = compras_celsia["Monto invertido"].sum()
+        acciones_compradas = compras_celsia["Cantidad"].sum()
+        precio_promedio = (
+            total_invertido / acciones_compradas if acciones_compradas else 0.0
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Monto objetivo", f"{monto_simulado:,.0f}")
+        c2.metric("Monto invertido", f"{total_invertido:,.0f}")
+        c3.metric("Acciones simuladas", f"{acciones_compradas:,.0f}")
+        c4.metric("Precio promedio", f"{precio_promedio:,.2f}")
+        st.altair_chart(
+            grafico_celsia_con_compras(historico_celsia, compras_celsia),
+            width="stretch",
+        )
+        st.caption(
+            f"Saldo no invertido por redondeo a acciones enteras: {efectivo_restante:,.2f} COP."
+        )
+        with st.expander("Ver detalle de compras simuladas"):
+            st.dataframe(compras_celsia, width="stretch", hide_index=True)
+
+        st.subheader("Proyeccion operativa del precio de Celsia")
+        dataset_modelo_celsia = construir_dataset_modelo_celsia(
+            historico_celsia,
+            precio_bolsa_xm,
+            generacion_solar_xm,
+            demanda_energia_xm,
+            generacion_hidraulica_xm,
+            None,
+            dividendos_celsia_base(),
+        )
+        entrenamiento_celsia, prueba_celsia = separar_entrenamiento_prueba_celsia(
+            dataset_modelo_celsia
+        )
+        entrenamiento_celsia, metricas_modelo_celsia = ajustar_modelo_lineal_celsia(
+            entrenamiento_celsia
+        )
+        prueba_celsia = aplicar_modelo_celsia(prueba_celsia, metricas_modelo_celsia)
+        metricas_entrenamiento = evaluar_modelo_celsia(entrenamiento_celsia)
+        metricas_prueba = evaluar_modelo_celsia(prueba_celsia)
+        dataset_modelo_celsia = pd.concat(
+            [entrenamiento_celsia, prueba_celsia],
+            ignore_index=True,
+        )
+        if dataset_modelo_celsia.empty or not metricas_modelo_celsia:
+            st.info(
+                "No hay suficientes datos alineados entre Celsia, precio de bolsa y generacion solar para ajustar la proyeccion."
+            )
+        else:
+            ultimo_precio_bolsa = dataset_modelo_celsia["precio_bolsa_energia"].iloc[-1]
+            ultima_generacion_solar = dataset_modelo_celsia["generacion_solar_gwh"].iloc[-1]
+            ultimos_valores = {
+                variable: dataset_modelo_celsia[variable].iloc[-1]
+                for variable in metricas_modelo_celsia["coeficientes"]
+                if variable != "intercepto" and variable in dataset_modelo_celsia
+            }
+            precio_estimado_actual = proyectar_precio_celsia(
+                metricas_modelo_celsia,
+                ultimos_valores,
+            )
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Observaciones train", f"{metricas_entrenamiento.get('observaciones', 0)}")
+            m2.metric("Observaciones test", f"{metricas_prueba.get('observaciones', 0)}")
+            m3.metric("R² train", f"{metricas_entrenamiento.get('r2', 0):.2f}")
+            m4.metric("R² test", f"{metricas_prueba.get('r2', 0):.2f}")
+            e1, e2, e3 = st.columns(3)
+            e1.metric("MAE train", f"{metricas_entrenamiento.get('mae', 0):.2f}")
+            e2.metric("MAE test", f"{metricas_prueba.get('mae', 0):.2f}")
+            e3.metric("Precio estimado actual", f"{precio_estimado_actual:,.2f}")
+            st.caption(
+                "Modelo lineal exploratorio con separacion temporal 80/20: entrena con la primera parte de la serie y evalua sobre fechas posteriores no vistas."
+            )
+            st.altair_chart(
+                grafico_precio_real_vs_estimado_celsia(dataset_modelo_celsia),
+                width="stretch",
+            )
+            if not prueba_celsia.empty:
+                st.subheader("Desempeno fuera de muestra")
+                st.altair_chart(
+                    grafico_precio_real_vs_estimado_celsia(prueba_celsia),
+                    width="stretch",
+                )
+            p1, p2 = st.columns(2)
+            with p1:
+                escenario_precio_bolsa = st.number_input(
+                    "Escenario precio bolsa (COP/kWh)",
+                    value=float(ultimo_precio_bolsa),
+                    key="escenario_precio_bolsa_celsia",
+                )
+            with p2:
+                escenario_generacion_solar = st.number_input(
+                    "Escenario generacion solar (GWh/dia)",
+                    value=float(ultima_generacion_solar),
+                    key="escenario_generacion_solar_celsia",
+                )
+            escenario_valores = dict(ultimos_valores)
+            escenario_valores["precio_bolsa_energia"] = escenario_precio_bolsa
+            escenario_valores["generacion_solar_gwh"] = escenario_generacion_solar
+            precio_proyectado_escenario = proyectar_precio_celsia(
+                metricas_modelo_celsia,
+                escenario_valores,
+            )
+            st.metric(
+                "Precio proyectado bajo escenario",
+                f"{precio_proyectado_escenario:,.2f}",
+            )
+
+            with st.expander("Ver dividendos integrados al modelo"):
+                st.dataframe(dividendos_celsia_base(), width="stretch", hide_index=True)
+
+
+    try:
+        dataset_celsia = cargar_dataset_celsia(archivo_celsia)
+    except Exception as error:
+        st.error(str(error))
+        return
+
+    if dataset_celsia.empty:
+        st.info(
+            "Sube un CSV o XLSX con la plantilla para empezar el analisis de Celsia y energia solar."
+        )
+        return
+
+        st.subheader("Vista inicial de variables")
+        st.altair_chart(grafico_celsia_variables(dataset_celsia), width="stretch")
+        with st.expander("Ver dataset cargado"):
+            st.dataframe(dataset_celsia, width="stretch", hide_index=True)
+
+
 def obtener_x_secrets():
     bearer_env = os.environ.get("X_BEARER_TOKEN", "") or os.environ.get(
         "TWITTER_BEARER_TOKEN", ""
@@ -1490,634 +2639,13 @@ def grafico_timeline_con_noticias(serie, eventos, metrica):
 
 def main():
     st.set_page_config(
-        page_title="Fondo de Acciones",
-        page_icon=":bar_chart:",
+        page_title="Celsia y energia solar",
+        page_icon=":sunny:",
         layout="wide",
     )
     cargar_env_local()
     aplicar_estilos()
-
-    fuentes = ["Datos integrados"]
-    if ARCHIVO_LOCAL.exists():
-        fuentes.insert(0, "CSV local")
-    fuentes.append("Archivo subido")
-
-    with st.sidebar:
-        st.header("Fuente de datos")
-        origen = st.radio("Selecciona la fuente", options=fuentes, index=0)
-        archivo_subido = None
-        if origen == "Archivo subido":
-            archivo_subido = st.file_uploader(
-                "Sube un archivo",
-                type=["csv", "xlsx"],
-                help="Para archivos XLSX se necesita openpyxl en el entorno.",
-            )
-
-    try:
-        fondo, descripcion = construir_fondo(origen, archivo_subido)
-    except Exception as error:
-        st.error(str(error))
-        st.stop()
-
-    df = construir_movimientos_df(fondo)
-    if df.empty:
-        st.warning("No hay movimientos para mostrar.")
-        st.stop()
-
-    acciones_disponibles = sorted(df["Accion"].unique().tolist())
-    fecha_min = df["Fecha"].min().date()
-    fecha_max_movimientos = df["Fecha"].max().date()
-    fecha_actual = pd.Timestamp.today().date()
-    fecha_max = fecha_actual
-
-    with st.sidebar:
-        st.divider()
-        st.header("Filtros")
-        acciones_seleccionadas = st.multiselect(
-            "Acciones",
-            options=acciones_disponibles,
-            default=acciones_disponibles,
-        )
-        rango_fechas = st.date_input(
-            "Rango de fechas",
-            value=(fecha_min, fecha_max),
-            min_value=fecha_min,
-            max_value=fecha_max,
-            key=f"rango_fechas_hasta_{fecha_actual.isoformat()}",
-        )
-        st.divider()
-        st.header("Yahoo Finance")
-        usar_yfinance = st.checkbox("Traer precios actuales", value=True)
-        tickers_yfinance = {}
-        with st.expander("Tickers"):
-            for accion in acciones_disponibles:
-                tickers_yfinance[accion] = st.text_input(
-                    accion,
-                    value=TICKERS_YFINANCE.get(accion, f"{accion}.CL"),
-                    key=f"ticker_yfinance_{accion}",
-                )
-        st.divider()
-        st.header("Noticias de X")
-        usar_x_api = st.checkbox("Traer noticias de X", value=False)
-        x_secrets = obtener_x_secrets()
-        if x_secrets.get("source") == ".env":
-            x_bearer_token = x_secrets.get("bearer_token", "")
-            st.caption("Token de X cargado desde .env")
-        else:
-            x_bearer_token = st.text_input(
-                "Bearer token",
-                value=x_secrets.get("bearer_token", ""),
-                type="password",
-                key="x_bearer_token_manual",
-            )
-        cuentas_x = leer_cuentas_x_monitoreadas()
-        x_query = st.text_area("Query X", value=construir_query_x_cuentas(cuentas_x), height=90)
-        x_max_results = st.number_input("Max posts", min_value=10, max_value=100, value=20, step=10)
-
-
-    if not isinstance(rango_fechas, tuple) or len(rango_fechas) != 2:
-        rango_fechas = (fecha_min, fecha_max)
-
-    df_filtrado = aplicar_filtros(df, acciones_seleccionadas, rango_fechas)
-    if df_filtrado.empty:
-        st.warning("No hay movimientos con los filtros seleccionados.")
-        st.stop()
-
-    resumen_general = construir_resumen_general(df_filtrado)
-    indicadores, resumen_financiero = construir_resumen_financiero(
-        fondo, df_filtrado, resumen_general
-    )
-    serie_tiempo = construir_serie_tiempo(df_filtrado)
-
-    compras_aprobadas = df_filtrado[
-        (df_filtrado["EstadoKey"] == "aprobada")
-        & (df_filtrado["TipoKey"] == "compra")
-    ].copy()
-    ventas = df_filtrado[
-        (df_filtrado["EstadoKey"] == "aprobada")
-        & (df_filtrado["TipoKey"] == "venta")
-    ].copy()
-    dividendos = df_filtrado[
-        (df_filtrado["EstadoKey"] == "aprobada")
-        & (df_filtrado["TipoKey"] == "dividendo")
-    ].copy()
-    canceladas = df_filtrado[df_filtrado["EstadoKey"] == "cancelada"].copy()
-    posiciones_vigentes = resumen_general[resumen_general["Acciones vigentes"] > 0]
-
-    historico_yfinance = pd.DataFrame()
-    precios_yfinance = pd.DataFrame()
-    errores_yfinance = []
-    balance_yfinance = pd.DataFrame()
-    posts_x = leer_cache_x_posts()
-    posts_x_nuevos = pd.DataFrame()
-    error_x_api = None
-    operaciones_precio = construir_operaciones_precio_df(
-        df_filtrado,
-        posiciones_vigentes["Accion"].tolist(),
-    )
-    posts_x_acciones = asociar_posts_con_acciones(posts_x)
-    if usar_yfinance and not posiciones_vigentes.empty:
-        acciones_vigentes = posiciones_vigentes["Accion"].tolist()
-        tickers_posiciones = {
-            accion: tickers_yfinance.get(accion, "")
-            for accion in acciones_vigentes
-        }
-        fechas_inicio_yfinance = obtener_fechas_inicio_yfinance(df_filtrado)
-        with st.spinner("Consultando Yahoo Finance..."):
-            try:
-                (
-                    historico_yfinance,
-                    precios_yfinance,
-                    errores_yfinance,
-                ) = descargar_historicos_yfinance(
-                    tickers_posiciones,
-                    fechas_inicio_yfinance,
-                )
-            except Exception as error:
-                errores_yfinance = [str(error)]
-
-    if not precios_yfinance.empty:
-        precios_yfinance_map = precios_yfinance.set_index("Accion")[
-            "Precio actual"
-        ].to_dict()
-        balance_yfinance = construir_balance_actual(
-            resumen_general,
-            precios_yfinance_map,
-        )
-
-    if usar_x_api:
-        if not x_bearer_token:
-            error_x_api = "Ingresa X_BEARER_TOKEN en .env o pega un bearer token en la barra lateral."
-        else:
-            with st.spinner("Consultando X API..."):
-                try:
-                    posts_x, posts_x_nuevos = consultar_y_cachear_x_posts(
-                        x_bearer_token,
-                        x_query,
-                        x_max_results,
-                    )
-                except Exception as error:
-                    error_x_api = str(error)
-
-    posts_x_acciones = asociar_posts_con_acciones(posts_x)
-    eventos_noticias = construir_eventos_noticias_df(posts_x_acciones, historico_yfinance)
-    impacto_noticias = calcular_impacto_noticias(eventos_noticias, historico_yfinance)
-    resumen_impacto_noticias = resumir_impacto_noticias(impacto_noticias)
-
-
-
-    st.markdown(
-        f"""
-        <section class="hero">
-            <div class="hero-kicker">Dashboard financiero</div>
-            <h1>Fondo de Acciones</h1>
-            <p>{descripcion} Vista filtrada entre {rango_fechas[0]} y {rango_fechas[1]} para {len(acciones_seleccionadas)} acciones. Ultimo movimiento registrado: {fecha_max_movimientos}.</p>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    metrica_1, metrica_2, metrica_3, metrica_4 = st.columns(4)
-    metrica_1.metric(
-        "Costo portafolio actual",
-        fondo._formatear_numero(indicadores["Costo portafolio actual"]),
-    )
-    metrica_2.metric(
-        "Flujo neto invertido",
-        fondo._formatear_numero(indicadores["Flujo neto invertido"]),
-    )
-    metrica_3.metric(
-        "Disponible para invertir",
-        fondo._formatear_numero(
-            indicadores["Disponible para invertir (dinero a favor)"]
-        ),
-    )
-    metrica_4.metric(
-        "Resultado realizado",
-        fondo._formatear_numero(indicadores["Resultado realizado"]),
-    )
-
-    metrica_5, metrica_6, metrica_7, metrica_8 = st.columns(4)
-    metrica_5.metric(
-        "Ventas netas",
-        fondo._formatear_numero(indicadores["Ventas netas"]),
-    )
-    metrica_6.metric(
-        "Comisiones acumuladas",
-        fondo._formatear_numero(indicadores["Comisiones acumuladas"]),
-    )
-    metrica_7.metric(
-        "Dividendos netos",
-        fondo._formatear_numero(indicadores["Dividendos netos"]),
-    )
-    metrica_8.metric(
-        "Acciones vigentes",
-        fondo._formatear_numero(indicadores["Acciones vigentes"]),
-    )
-
-    if not balance_yfinance.empty:
-        total_valor_yfinance = balance_yfinance["Valor actual"].sum()
-        total_balance_yfinance = balance_yfinance["Balance"].sum()
-        total_costo_yfinance = balance_yfinance["Costo portafolio actual"].sum()
-        rentabilidad_yfinance = (
-            (total_balance_yfinance / total_costo_yfinance) * 100
-            if total_costo_yfinance > 0
-            else 0.0
-        )
-
-        valor_col, balance_col, rentabilidad_col = st.columns(3)
-        valor_col.metric(
-            "Valor actual acciones",
-            fondo._formatear_numero(total_valor_yfinance),
-        )
-        balance_col.metric(
-            "Balance a precio actual",
-            fondo._formatear_numero(total_balance_yfinance),
-        )
-        rentabilidad_col.metric(
-            "Rentabilidad actual",
-            f"{fondo._formatear_numero(rentabilidad_yfinance)}%",
-        )
-
-    resumen_col, descarga_col = st.columns([3, 1])
-    with resumen_col:
-        st.caption(descripcion)
-    with descarga_col:
-        st.download_button(
-            "Descargar vista filtrada",
-            data=convertir_df_a_csv(df_filtrado),
-            file_name="movimientos_filtrados.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-    col_izquierda, col_derecha = st.columns(2)
-    with col_izquierda:
-        st.subheader("Costo vs valor actual por accion")
-        if balance_yfinance.empty:
-            st.altair_chart(
-                grafico_inversion_por_accion(resumen_general),
-                width="stretch",
-            )
-        else:
-            st.altair_chart(
-                grafico_costo_vs_valor_actual(balance_yfinance),
-                width="stretch",
-            )
-
-        st.subheader("Resultado realizado por ventas")
-        acciones_con_ventas = resumen_general[
-            resumen_general["Cantidad vendida"] > 0
-        ]
-        if acciones_con_ventas.empty:
-            st.info("No hay ventas realizadas en el rango seleccionado.")
-        else:
-            st.caption(
-                f"Solo {len(acciones_con_ventas)} accion(es) tienen ventas realizadas; las demas se mantienen vigentes."
-            )
-            st.altair_chart(
-                grafico_ganancia_perdida(resumen_general),
-                width="stretch",
-            )
-
-    with col_derecha:
-        st.subheader("Cantidad de acciones vigentes")
-        st.altair_chart(
-            grafico_acciones_por_accion(resumen_general),
-            width="stretch",
-        )
-
-        st.subheader("Diferencia actual por accion")
-        if balance_yfinance.empty:
-            st.info("Activa Yahoo Finance para graficar el valor actual.")
-        else:
-            st.altair_chart(
-                grafico_valor_actual_por_accion(balance_yfinance),
-                width="stretch",
-            )
-
-    st.subheader("Capital neto invertido")
-    if serie_tiempo.empty:
-        st.info("No hay suficientes movimientos aprobados para graficar el flujo.")
-    else:
-        st.caption(
-            "Arriba ves el movimiento diario: las compras suman y las ventas/dividendos restan. Abajo ves el capital neto que sigue invertido despues de cada movimiento."
-        )
-        st.altair_chart(grafico_flujo(serie_tiempo), width="stretch")
-
-    tablas = st.tabs(
-        [
-            "Compras aprobadas",
-            "Ventas",
-            "Dividendos",
-            "Canceladas",
-            "Resumen por accion",
-            "Historico y precios",
-            "Balance actual",
-            "Noticias X",
-            "Resumen financiero",
-        ]
-    )
-
-    with tablas[0]:
-        mostrar_tabla_movimientos("Compras aprobadas", compras_aprobadas, fondo)
-
-    with tablas[1]:
-        mostrar_tabla_movimientos("Ventas", ventas, fondo)
-
-    with tablas[2]:
-        mostrar_tabla_movimientos("Dividendos", dividendos, fondo)
-
-    with tablas[3]:
-        mostrar_tabla_movimientos("Canceladas", canceladas, fondo)
-
-    with tablas[4]:
-        st.subheader("Resumen general por accion")
-        resumen_mostrable = formatear_tabla(
-            resumen_general,
-            fondo,
-            [
-                "Cantidad comprada",
-                "Total comprado",
-                "Cantidad vendida",
-                "Ventas netas",
-                "Dividendos netos",
-                "Acciones vigentes",
-                "Costo promedio compra",
-                "Costo portafolio actual",
-                "Resultado realizado",
-                "Cantidad cancelada",
-                "Total cancelado",
-            ],
-        )
-        st.dataframe(resumen_mostrable, width="stretch", hide_index=True)
-
-    with tablas[5]:
-        st.subheader("Historico desde la primera compra")
-        if not usar_yfinance:
-            st.info("Activa Yahoo Finance en la barra lateral para consultar precios.")
-        elif precios_yfinance.empty:
-            st.warning("No se encontraron precios en Yahoo Finance para las posiciones vigentes.")
-        else:
-            acciones_grafico = st.multiselect(
-                "Acciones para comparar",
-                options=precios_yfinance["Accion"].tolist(),
-                default=precios_yfinance["Accion"].tolist(),
-                key="acciones_historico_vs_operaciones",
-            )
-            historico_comparado = historico_yfinance[
-                historico_yfinance["Accion"].isin(acciones_grafico)
-            ].copy()
-            operaciones_comparadas = operaciones_precio[
-                operaciones_precio["Accion"].isin(acciones_grafico)
-            ].copy()
-
-            precios_mostrables = precios_yfinance.copy()
-            precios_mostrables["Fecha inicio"] = precios_mostrables[
-                "Fecha inicio"
-            ].dt.strftime("%Y-%m-%d")
-            precios_mostrables["Ultima fecha"] = precios_mostrables[
-                "Ultima fecha"
-            ].dt.strftime("%Y-%m-%d")
-            precios_mostrables = formatear_tabla(
-                precios_mostrables,
-                fondo,
-                ["Precio actual"],
-            )
-            st.dataframe(precios_mostrables, width="stretch", hide_index=True)
-
-            eventos_noticias_comparados = eventos_noticias[
-                eventos_noticias["Accion"].isin(acciones_grafico)
-            ].copy() if not eventos_noticias.empty else pd.DataFrame()
-
-            if not historico_comparado.empty and not eventos_noticias_comparados.empty:
-                st.caption(
-                    "Los diamantes marcan noticias de X asociadas a la accion y se ubican en la primera sesion bursatil disponible posterior al post."
-                )
-                st.altair_chart(
-                    grafico_historico_vs_noticias(
-                        historico_comparado,
-                        eventos_noticias_comparados,
-                    ),
-                    width="stretch",
-                )
-            elif not historico_comparado.empty and not operaciones_comparadas.empty:
-                st.altair_chart(
-                    grafico_historico_vs_operaciones(
-                        historico_comparado,
-                        operaciones_comparadas,
-                    ),
-                    width="stretch",
-                )
-            elif not historico_comparado.empty:
-                st.altair_chart(
-                    grafico_historico_precios(historico_comparado),
-                    width="stretch",
-                )
-            if not balance_yfinance.empty:
-                total_valor_yfinance = balance_yfinance["Valor actual"].sum()
-                st.metric(
-                    "Suma valor actual de acciones",
-                    fondo._formatear_numero(total_valor_yfinance),
-                )
-                st.altair_chart(
-                    grafico_valor_actual_por_accion(balance_yfinance),
-                    width="stretch",
-                )
-
-            st.subheader("Linea de tiempo de noticias e impacto")
-            accion_timeline = st.selectbox(
-                "Accion para analizar",
-                options=acciones_grafico,
-                key="accion_timeline_noticias",
-            )
-            metrica_timeline = st.radio(
-                "Metrica de la linea",
-                options=["Variacion acumulada %", "Variacion diaria %", "Close"],
-                format_func=lambda valor: {
-                    "Variacion acumulada %": "Variacion acumulada",
-                    "Variacion diaria %": "Variacion diaria",
-                    "Close": "Precio de cierre",
-                }[valor],
-                horizontal=True,
-                key="metrica_timeline_noticias",
-            )
-            serie_timeline = construir_timeline_accion(
-                historico_comparado,
-                accion_timeline,
-            )
-            eventos_timeline = preparar_eventos_timeline(
-                eventos_noticias_comparados,
-                accion_timeline,
-                serie_timeline,
-                metrica_timeline,
-            )
-            st.caption(
-                "Los diamantes muestran noticias relacionadas con la accion seleccionada. Para comparar reacciones, la vista recomendada es 'Variacion acumulada'."
-            )
-            st.altair_chart(
-                grafico_timeline_con_noticias(
-                    serie_timeline,
-                    eventos_timeline,
-                    metrica_timeline,
-                ),
-                width="stretch",
-            )
-
-        for error in errores_yfinance:
-            st.caption(error)
-
-    with tablas[6]:
-        st.subheader("Balance actual por accion")
-        if posiciones_vigentes.empty:
-            st.info("No hay acciones vigentes para calcular balance.")
-        else:
-            st.caption(
-                "Los precios vienen de Yahoo Finance cuando estan disponibles. Puedes ajustarlos manualmente antes de calcular el balance."
-            )
-
-            precios_actuales = {}
-            precios_yfinance_map = (
-                precios_yfinance.set_index("Accion")["Precio actual"].to_dict()
-                if not precios_yfinance.empty
-                else {}
-            )
-            columnas_precios = st.columns(3)
-            for indice, fila in enumerate(posiciones_vigentes.to_dict("records")):
-                with columnas_precios[indice % 3]:
-                    precio_base = precios_yfinance_map.get(
-                        fila["Accion"],
-                        fila["Costo promedio compra"],
-                    )
-                    precios_actuales[fila["Accion"]] = st.number_input(
-                        f"Precio actual de {fila['Accion']}",
-                        min_value=0.0,
-                        value=float(precio_base),
-                        step=1.0,
-                        format="%.2f",
-                        key=f"precio_actual_{fila['Accion']}",
-                    )
-
-            balance_actual = construir_balance_actual(resumen_general, precios_actuales)
-            total_costo = balance_actual["Costo portafolio actual"].sum()
-            total_valor = balance_actual["Valor actual"].sum()
-            total_balance = balance_actual["Balance"].sum()
-
-            balance_m1, balance_m2, balance_m3 = st.columns(3)
-            balance_m1.metric("Costo base vigente", fondo._formatear_numero(total_costo))
-            balance_m2.metric("Valor actual", fondo._formatear_numero(total_valor))
-            balance_m3.metric("Balance", fondo._formatear_numero(total_balance))
-
-            st.subheader("Precio promedio de compra vs precio actual")
-            st.caption(
-                "Comparacion por unidad: permite ver rapidamente si cada accion cotiza por encima o por debajo de tu costo promedio."
-            )
-            st.altair_chart(
-                grafico_precio_promedio_vs_actual(balance_actual),
-                width="stretch",
-            )
-
-            balance_mostrable = formatear_tabla(
-                balance_actual,
-                fondo,
-                [
-                    "Acciones vigentes",
-                    "Costo promedio compra",
-                    "Costo portafolio actual",
-                    "Precio actual",
-                    "Valor actual",
-                    "Balance",
-                ],
-            )
-            balance_mostrable["Rentabilidad %"] = balance_actual["Rentabilidad %"].map(
-                lambda valor: f"{fondo._formatear_numero(valor)}%"
-            )
-            st.dataframe(balance_mostrable, width="stretch", hide_index=True)
-
-    with tablas[7]:
-        st.subheader("Noticias de X")
-        st.caption(
-            "La caché local se muestra aunque no haya token. Para refrescar noticias en vivo, usa tu propio token de X."
-        )
-        if error_x_api:
-            st.error(error_x_api)
-        elif posts_x.empty:
-            st.info("Aun no hay noticias cacheadas. Activa 'Traer noticias de X' para descargar publicaciones recientes.")
-        else:
-            x1, x2, x3 = st.columns(3)
-            x1.metric("Posts cacheados", fondo._formatear_numero(len(posts_x)))
-            x2.metric("Nuevos descargados", fondo._formatear_numero(len(posts_x_nuevos)))
-            x3.metric("Posts asociados a acciones", fondo._formatear_numero(len(posts_x_acciones)))
-            st.altair_chart(grafico_x_menciones(posts_x), width="stretch")
-            st.altair_chart(grafico_x_posts_por_autor(posts_x), width="stretch")
-            st.subheader("Impacto posterior por accion")
-            st.caption(
-                "Lectura descriptiva: mide la variacion del cierre tras 1, 3 y 5 sesiones; no prueba causalidad por si sola."
-            )
-            if resumen_impacto_noticias.empty:
-                st.info("Aun no hay noticias asociadas a acciones colombianas con suficiente historico para medir impacto.")
-            else:
-                resumen_impacto_mostrable = formatear_tabla(
-                    resumen_impacto_noticias,
-                    fondo,
-                    [
-                        "Noticias",
-                        "Retorno +1 sesiones %",
-                        "Retorno +3 sesiones %",
-                        "Retorno +5 sesiones %",
-                        "Noticias positivas +1 sesiones %",
-                        "Noticias positivas +3 sesiones %",
-                        "Noticias positivas +5 sesiones %",
-                    ],
-                )
-                st.dataframe(resumen_impacto_mostrable, width="stretch", hide_index=True)
-                st.altair_chart(
-                    grafico_impacto_promedio(resumen_impacto_noticias),
-                    width="stretch",
-                )
-            if not impacto_noticias.empty:
-                st.subheader("Distribucion de retornos posteriores")
-                st.altair_chart(
-                    grafico_distribucion_impacto(impacto_noticias),
-                    width="stretch",
-                )
-                st.subheader("Detalle por noticia")
-                detalle_impacto = impacto_noticias.copy()
-                detalle_impacto["Fecha post"] = detalle_impacto["Fecha post"].dt.strftime("%Y-%m-%d %H:%M")
-                detalle_impacto["Fecha evento"] = detalle_impacto["Fecha evento"].dt.strftime("%Y-%m-%d")
-                detalle_impacto = formatear_tabla(
-                    detalle_impacto,
-                    fondo,
-                    [
-                        "Precio evento",
-                        "Retorno previo 1 sesiones %",
-                        "Retorno previo 3 sesiones %",
-                        "Retorno previo 5 sesiones %",
-                        "Retorno +1 sesiones %",
-                        "Retorno +3 sesiones %",
-                        "Retorno +5 sesiones %",
-                    ],
-                )
-                st.dataframe(detalle_impacto, width="stretch", hide_index=True)
-            posts_mostrables = posts_x.copy()
-            posts_mostrables["Fecha"] = posts_mostrables["Fecha"].dt.strftime("%Y-%m-%d %H:%M")
-            posts_mostrables = formatear_tabla(
-                posts_mostrables,
-                fondo,
-                ["Seguidores", "Likes", "Respuestas", "Reposts", "Citas", "Engagement"],
-            )
-            st.dataframe(posts_mostrables, width="stretch", hide_index=True)
-
-    with tablas[8]:
-        st.subheader("Resumen financiero")
-        resumen_financiero_mostrable = formatear_tabla(
-            resumen_financiero,
-            fondo,
-            ["Valor"],
-        )
-        st.dataframe(
-            resumen_financiero_mostrable, width="stretch", hide_index=True
-        )
+    mostrar_modulo_celsia_energia_solar()
 
 
 if __name__ == "__main__":
