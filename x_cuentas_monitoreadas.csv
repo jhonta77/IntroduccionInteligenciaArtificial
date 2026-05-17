@@ -1,0 +1,4 @@
+username,nombre,tipo,score_autoridad,region,temas,palabras_clave,activo
+binance,Binance,Exchange,5,Global,"cripto,exchange,futuros","BTC,ETH,BZUSDT",True
+cz_binance,CZ,Lider cripto,4,Global,"cripto,exchange,futuros","BTC,ETH,BNB,BZUSDT",True
+OPECSecretariat,OPEC,Commodity,6,Global,"petroleo,energia","Brent,ECOPETROL",True
