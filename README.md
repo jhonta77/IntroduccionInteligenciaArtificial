@@ -8,6 +8,7 @@ Dashboard en Streamlit para analizar un portafolio a partir de transacciones ya 
 - Resumen por acción, compras, ventas, dividendos y balance actual
 - Consulta opcional de precios actuales e histórico desde Yahoo Finance mediante `yfinance`
 - Noticias recientes desde X, con caché local y token propio opcional
+- Asociación de noticias con acciones colombianas y medición descriptiva del retorno posterior a 1, 3 y 5 sesiones
 - Carga alternativa de archivos CSV o XLSX con la misma estructura
 
 ## Qué no incluye

@@ -27,6 +27,7 @@ TICKERS_YFINANCE = {
     "PFCIBEST": "PFCIBEST.CL",
     "IBITCO": "IBITCO.CL",
 }
+ACCIONES_COLOMBIANAS = ["ECOPETROL", "MINEROS", "NUCO", "PFCIBEST"]
 
 
 def cargar_env_local():
@@ -756,6 +757,53 @@ def grafico_costo_vs_valor_actual(balance_actual):
     )
 
 
+def grafico_precio_promedio_vs_actual(balance_actual):
+    base = balance_actual[
+        [
+            "Accion",
+            "Costo promedio compra",
+            "Precio actual",
+            "Rentabilidad %",
+        ]
+    ].copy()
+    base = base.melt(
+        id_vars=["Accion", "Rentabilidad %"],
+        value_vars=["Costo promedio compra", "Precio actual"],
+        var_name="Concepto",
+        value_name="Precio por unidad",
+    )
+    base["Concepto"] = base["Concepto"].replace(
+        {
+            "Costo promedio compra": "Promedio compra",
+            "Precio actual": "Precio actual",
+        }
+    )
+    return (
+        alt.Chart(base)
+        .mark_bar(cornerRadiusTopLeft=7, cornerRadiusTopRight=7)
+        .encode(
+            x=alt.X("Accion:N", title=None),
+            xOffset=alt.XOffset("Concepto:N"),
+            y=alt.Y("Precio por unidad:Q", title="Precio por unidad"),
+            color=alt.Color(
+                "Concepto:N",
+                scale=alt.Scale(
+                    domain=["Promedio compra", "Precio actual"],
+                    range=["#a16207", "#0f766e"],
+                ),
+                legend=alt.Legend(title="Comparacion"),
+            ),
+            tooltip=[
+                alt.Tooltip("Accion:N", title="Accion"),
+                alt.Tooltip("Concepto:N", title="Concepto"),
+                alt.Tooltip("Precio por unidad:Q", title="Precio por unidad", format=",.2f"),
+                alt.Tooltip("Rentabilidad %:Q", title="Rentabilidad %", format=",.2f"),
+            ],
+        )
+        .properties(height=330)
+    )
+
+
 def construir_serie_tiempo(df):
     aprobados = df[df["EstadoKey"] == "aprobada"].copy()
     if aprobados.empty:
@@ -1032,11 +1080,14 @@ def leer_cuentas_x_monitoreadas():
 
 
 def construir_query_x_cuentas(cuentas):
+    acciones = " OR ".join(ACCIONES_COLOMBIANAS)
     if cuentas.empty:
-        return "ECOPETROL OR MINEROS OR PFCIBEST -is:retweet"
+        return f"({acciones}) -is:retweet"
     activas = cuentas[cuentas["activo"]] if "activo" in cuentas else cuentas
     autores = [f"from:{usuario}" for usuario in activas["username"].dropna().astype(str)]
-    return "(" + " OR ".join(autores) + ") -is:retweet"
+    if not autores:
+        return f"({acciones}) -is:retweet"
+    return f"(({acciones}) OR ({' OR '.join(autores)})) -is:retweet"
 
 
 def leer_cache_x_posts():
@@ -1145,6 +1196,296 @@ def grafico_x_posts_por_autor(posts):
         )
         .properties(height=260)
     )
+
+
+def asociar_posts_con_acciones(posts):
+    if posts.empty:
+        return pd.DataFrame()
+
+    filas = []
+    for post in posts.to_dict("records"):
+        texto = str(post.get("Texto", "")).upper()
+        for accion in ACCIONES_COLOMBIANAS:
+            if accion in texto:
+                filas.append({**post, "Accion": accion})
+    return pd.DataFrame(filas)
+
+
+def construir_eventos_noticias_df(posts_acciones, historico_df):
+    if posts_acciones.empty or historico_df.empty:
+        return pd.DataFrame()
+
+    eventos = []
+    historico_ordenado = historico_df.copy()
+    historico_ordenado["Fecha"] = pd.to_datetime(historico_ordenado["Fecha"])
+
+    for post in posts_acciones.to_dict("records"):
+        serie = historico_ordenado[
+            historico_ordenado["Accion"] == post["Accion"]
+        ].sort_values("Fecha")
+        if serie.empty:
+            continue
+
+        fecha_post = pd.to_datetime(post["Fecha"])
+        posteriores = serie[serie["Fecha"] >= fecha_post.normalize()]
+        if posteriores.empty:
+            continue
+
+        fila_precio = posteriores.iloc[0]
+        eventos.append(
+            {
+                **post,
+                "Fecha evento": fila_precio["Fecha"],
+                "Precio evento": float(fila_precio["Close"]),
+            }
+        )
+    return pd.DataFrame(eventos)
+
+
+def calcular_impacto_noticias(eventos_noticias, historico_df):
+    if eventos_noticias.empty or historico_df.empty:
+        return pd.DataFrame()
+
+    filas = []
+    historico = historico_df.copy()
+    historico["Fecha"] = pd.to_datetime(historico["Fecha"])
+
+    for evento in eventos_noticias.to_dict("records"):
+        serie = historico[historico["Accion"] == evento["Accion"]].sort_values("Fecha")
+        indice_evento = serie.index[serie["Fecha"] == evento["Fecha evento"]]
+        if indice_evento.empty:
+            continue
+        posicion = serie.index.get_loc(indice_evento[0])
+        fila = {
+            "Accion": evento["Accion"],
+            "Fecha post": evento["Fecha"],
+            "Fecha evento": evento["Fecha evento"],
+            "Autor": evento.get("Autor", ""),
+            "Texto": evento.get("Texto", ""),
+            "Precio evento": evento["Precio evento"],
+        }
+        for ventana in [1, 3, 5]:
+            if posicion - ventana >= 0:
+                precio_pasado = float(serie.iloc[posicion - ventana]["Close"])
+                fila[f"Retorno previo {ventana} sesiones %"] = (
+                    (evento["Precio evento"] / precio_pasado) - 1
+                ) * 100
+            else:
+                fila[f"Retorno previo {ventana} sesiones %"] = None
+            if posicion + ventana < len(serie):
+                precio_futuro = float(serie.iloc[posicion + ventana]["Close"])
+                fila[f"Retorno +{ventana} sesiones %"] = (
+                    (precio_futuro / evento["Precio evento"]) - 1
+                ) * 100
+            else:
+                fila[f"Retorno +{ventana} sesiones %"] = None
+        filas.append(fila)
+    return pd.DataFrame(filas)
+
+
+def resumir_impacto_noticias(impacto_noticias):
+    if impacto_noticias.empty:
+        return pd.DataFrame()
+    columnas_retorno = [col for col in impacto_noticias if col.startswith("Retorno +")]
+    datos = impacto_noticias.copy()
+    for ventana in [1, 3, 5]:
+        columna = f"Retorno +{ventana} sesiones %"
+        datos[f"Noticias positivas +{ventana} sesiones %"] = datos[columna].gt(0)
+    return (
+        datos.groupby("Accion", as_index=False)
+        .agg(
+            Noticias=("Accion", "size"),
+            **{
+                columna: (columna, "mean")
+                for columna in columnas_retorno
+            },
+            **{
+                f"Noticias positivas +{ventana} sesiones %": (
+                    f"Noticias positivas +{ventana} sesiones %",
+                    "mean",
+                )
+                for ventana in [1, 3, 5]
+            },
+        )
+        .sort_values("Noticias", ascending=False)
+    )
+
+
+def grafico_historico_vs_noticias(historico_df, eventos_noticias):
+    historico = historico_df.rename(columns={"Close": "Precio"}).copy()
+    noticias = eventos_noticias.rename(
+        columns={"Fecha evento": "Fecha", "Precio evento": "Precio"}
+    ).copy()
+
+    linea = (
+        alt.Chart(historico)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("Fecha:T", title="Fecha"),
+            y=alt.Y("Precio:Q", title="Precio cierre", scale=alt.Scale(zero=False)),
+            color=alt.Color("Accion:N", legend=alt.Legend(title="Accion")),
+            tooltip=[
+                alt.Tooltip("Fecha:T", title="Fecha"),
+                alt.Tooltip("Accion:N", title="Accion"),
+                alt.Tooltip("Precio:Q", title="Cierre", format=",.2f"),
+            ],
+        )
+    )
+    puntos = (
+        alt.Chart(noticias)
+        .mark_point(size=110, filled=True, shape="diamond", color="#7c2d12")
+        .encode(
+            x="Fecha:T",
+            y="Precio:Q",
+            tooltip=[
+                alt.Tooltip("Fecha:T", title="Fecha bursatil"),
+                alt.Tooltip("Accion:N", title="Accion"),
+                alt.Tooltip("Autor:N", title="Autor"),
+                alt.Tooltip("Texto:N", title="Post"),
+                alt.Tooltip("Precio:Q", title="Cierre", format=",.2f"),
+            ],
+        )
+    )
+    return (linea + puntos).properties(height=380)
+
+
+def construir_impacto_largo(impacto_noticias):
+    if impacto_noticias.empty:
+        return pd.DataFrame()
+    columnas = [f"Retorno +{ventana} sesiones %" for ventana in [1, 3, 5]]
+    largo = impacto_noticias.melt(
+        id_vars=["Accion", "Fecha post", "Autor"],
+        value_vars=columnas,
+        var_name="Ventana",
+        value_name="Retorno %",
+    ).dropna(subset=["Retorno %"])
+    largo["Ventana"] = largo["Ventana"].str.replace("Retorno +", "", regex=False)
+    return largo
+
+
+def grafico_impacto_promedio(resumen_impacto):
+    if resumen_impacto.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []}))
+    columnas = [f"Retorno +{ventana} sesiones %" for ventana in [1, 3, 5]]
+    largo = resumen_impacto.melt(
+        id_vars=["Accion"],
+        value_vars=columnas,
+        var_name="Ventana",
+        value_name="Retorno promedio %",
+    )
+    largo["Ventana"] = largo["Ventana"].str.replace("Retorno +", "", regex=False)
+    return (
+        alt.Chart(largo)
+        .mark_bar()
+        .encode(
+            x=alt.X("Ventana:N", title="Ventana posterior"),
+            y=alt.Y("Retorno promedio %:Q", title="Retorno promedio %"),
+            color=alt.Color("Accion:N", legend=alt.Legend(title="Accion")),
+            column=alt.Column("Accion:N", title=None),
+            tooltip=[
+                alt.Tooltip("Accion:N", title="Accion"),
+                alt.Tooltip("Ventana:N", title="Ventana"),
+                alt.Tooltip("Retorno promedio %:Q", title="Retorno promedio", format=",.2f"),
+            ],
+        )
+        .properties(height=260)
+    )
+
+
+def grafico_distribucion_impacto(impacto_noticias):
+    largo = construir_impacto_largo(impacto_noticias)
+    if largo.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []}))
+    return (
+        alt.Chart(largo)
+        .mark_circle(size=90, opacity=0.75)
+        .encode(
+            x=alt.X("Ventana:N", title="Ventana posterior"),
+            y=alt.Y("Retorno %:Q", title="Retorno por noticia %"),
+            color=alt.Color("Accion:N", legend=alt.Legend(title="Accion")),
+            tooltip=[
+                alt.Tooltip("Accion:N", title="Accion"),
+                alt.Tooltip("Ventana:N", title="Ventana"),
+                alt.Tooltip("Retorno %:Q", title="Retorno", format=",.2f"),
+                alt.Tooltip("Fecha post:T", title="Fecha post"),
+                alt.Tooltip("Autor:N", title="Autor"),
+            ],
+        )
+        .properties(height=280)
+    )
+
+
+def construir_timeline_accion(historico_df, accion):
+    serie = historico_df[historico_df["Accion"] == accion].sort_values("Fecha").copy()
+    if serie.empty:
+        return pd.DataFrame()
+    serie["Variacion diaria %"] = serie["Close"].pct_change() * 100
+    precio_inicial = float(serie.iloc[0]["Close"])
+    serie["Variacion acumulada %"] = ((serie["Close"] / precio_inicial) - 1) * 100
+    return serie
+
+
+def preparar_eventos_timeline(eventos_noticias, accion, serie, metrica):
+    if eventos_noticias.empty or serie.empty:
+        return pd.DataFrame()
+    eventos = eventos_noticias[eventos_noticias["Accion"] == accion].copy()
+    if eventos.empty:
+        return pd.DataFrame()
+    valor_por_fecha = serie.set_index("Fecha")[metrica].to_dict()
+    eventos["Valor"] = eventos["Fecha evento"].map(valor_por_fecha)
+    return eventos.dropna(subset=["Valor"])
+
+
+def grafico_timeline_con_noticias(serie, eventos, metrica):
+    titulo_y = {
+        "Close": "Precio de cierre",
+        "Variacion acumulada %": "Variacion acumulada %",
+        "Variacion diaria %": "Variacion diaria %",
+    }[metrica]
+    tooltip_linea = [
+        alt.Tooltip("Fecha:T", title="Fecha"),
+        alt.Tooltip("Close:Q", title="Cierre", format=",.2f"),
+        alt.Tooltip("Variacion acumulada %:Q", title="Variacion acumulada", format=",.2f"),
+        alt.Tooltip("Variacion diaria %:Q", title="Variacion diaria", format=",.2f"),
+    ]
+    base = alt.Chart(serie).encode(
+        x=alt.X("Fecha:T", title="Fecha"),
+        y=alt.Y(f"{metrica}:Q", title=titulo_y, scale=alt.Scale(zero=False)),
+    )
+
+    if metrica == "Variacion diaria %":
+        linea = base.mark_bar(opacity=0.8, color="#0f766e").encode(
+            tooltip=tooltip_linea,
+            color=alt.condition(
+                alt.datum["Variacion diaria %"] >= 0,
+                alt.value("#0f766e"),
+                alt.value("#b91c1c"),
+            ),
+        )
+    else:
+        linea = base.mark_line(strokeWidth=3, color="#0f766e").encode(
+            tooltip=tooltip_linea
+        )
+
+    if eventos.empty:
+        return linea.properties(height=360)
+
+    noticias = (
+        alt.Chart(eventos)
+        .mark_point(size=130, filled=True, shape="diamond", color="#7c2d12")
+        .encode(
+            x=alt.X("Fecha evento:T"),
+            y=alt.Y("Valor:Q"),
+            tooltip=[
+                alt.Tooltip("Fecha post:T", title="Fecha post"),
+                alt.Tooltip("Fecha evento:T", title="Sesion asociada"),
+                alt.Tooltip("Autor:N", title="Autor"),
+                alt.Tooltip("Texto:N", title="Noticia"),
+                alt.Tooltip("Valor:Q", title=titulo_y, format=",.2f"),
+            ],
+        )
+    )
+    return (linea + noticias).properties(height=360)
 
 
 def main():
@@ -1274,6 +1615,7 @@ def main():
         df_filtrado,
         posiciones_vigentes["Accion"].tolist(),
     )
+    posts_x_acciones = asociar_posts_con_acciones(posts_x)
     if usar_yfinance and not posiciones_vigentes.empty:
         acciones_vigentes = posiciones_vigentes["Accion"].tolist()
         tickers_posiciones = {
@@ -1316,6 +1658,11 @@ def main():
                     )
                 except Exception as error:
                     error_x_api = str(error)
+
+    posts_x_acciones = asociar_posts_con_acciones(posts_x)
+    eventos_noticias = construir_eventos_noticias_df(posts_x_acciones, historico_yfinance)
+    impacto_noticias = calcular_impacto_noticias(eventos_noticias, historico_yfinance)
+    resumen_impacto_noticias = resumir_impacto_noticias(impacto_noticias)
 
 
 
@@ -1539,7 +1886,22 @@ def main():
             )
             st.dataframe(precios_mostrables, width="stretch", hide_index=True)
 
-            if not historico_comparado.empty and not operaciones_comparadas.empty:
+            eventos_noticias_comparados = eventos_noticias[
+                eventos_noticias["Accion"].isin(acciones_grafico)
+            ].copy() if not eventos_noticias.empty else pd.DataFrame()
+
+            if not historico_comparado.empty and not eventos_noticias_comparados.empty:
+                st.caption(
+                    "Los diamantes marcan noticias de X asociadas a la accion y se ubican en la primera sesion bursatil disponible posterior al post."
+                )
+                st.altair_chart(
+                    grafico_historico_vs_noticias(
+                        historico_comparado,
+                        eventos_noticias_comparados,
+                    ),
+                    width="stretch",
+                )
+            elif not historico_comparado.empty and not operaciones_comparadas.empty:
                 st.altair_chart(
                     grafico_historico_vs_operaciones(
                         historico_comparado,
@@ -1562,6 +1924,45 @@ def main():
                     grafico_valor_actual_por_accion(balance_yfinance),
                     width="stretch",
                 )
+
+            st.subheader("Linea de tiempo de noticias e impacto")
+            accion_timeline = st.selectbox(
+                "Accion para analizar",
+                options=acciones_grafico,
+                key="accion_timeline_noticias",
+            )
+            metrica_timeline = st.radio(
+                "Metrica de la linea",
+                options=["Variacion acumulada %", "Variacion diaria %", "Close"],
+                format_func=lambda valor: {
+                    "Variacion acumulada %": "Variacion acumulada",
+                    "Variacion diaria %": "Variacion diaria",
+                    "Close": "Precio de cierre",
+                }[valor],
+                horizontal=True,
+                key="metrica_timeline_noticias",
+            )
+            serie_timeline = construir_timeline_accion(
+                historico_comparado,
+                accion_timeline,
+            )
+            eventos_timeline = preparar_eventos_timeline(
+                eventos_noticias_comparados,
+                accion_timeline,
+                serie_timeline,
+                metrica_timeline,
+            )
+            st.caption(
+                "Los diamantes muestran noticias relacionadas con la accion seleccionada. Para comparar reacciones, la vista recomendada es 'Variacion acumulada'."
+            )
+            st.altair_chart(
+                grafico_timeline_con_noticias(
+                    serie_timeline,
+                    eventos_timeline,
+                    metrica_timeline,
+                ),
+                width="stretch",
+            )
 
         for error in errores_yfinance:
             st.caption(error)
@@ -1607,6 +2008,15 @@ def main():
             balance_m2.metric("Valor actual", fondo._formatear_numero(total_valor))
             balance_m3.metric("Balance", fondo._formatear_numero(total_balance))
 
+            st.subheader("Precio promedio de compra vs precio actual")
+            st.caption(
+                "Comparacion por unidad: permite ver rapidamente si cada accion cotiza por encima o por debajo de tu costo promedio."
+            )
+            st.altair_chart(
+                grafico_precio_promedio_vs_actual(balance_actual),
+                width="stretch",
+            )
+
             balance_mostrable = formatear_tabla(
                 balance_actual,
                 fondo,
@@ -1637,9 +2047,58 @@ def main():
             x1, x2, x3 = st.columns(3)
             x1.metric("Posts cacheados", fondo._formatear_numero(len(posts_x)))
             x2.metric("Nuevos descargados", fondo._formatear_numero(len(posts_x_nuevos)))
-            x3.metric("Autores", fondo._formatear_numero(posts_x["Autor"].nunique()))
+            x3.metric("Posts asociados a acciones", fondo._formatear_numero(len(posts_x_acciones)))
             st.altair_chart(grafico_x_menciones(posts_x), width="stretch")
             st.altair_chart(grafico_x_posts_por_autor(posts_x), width="stretch")
+            st.subheader("Impacto posterior por accion")
+            st.caption(
+                "Lectura descriptiva: mide la variacion del cierre tras 1, 3 y 5 sesiones; no prueba causalidad por si sola."
+            )
+            if resumen_impacto_noticias.empty:
+                st.info("Aun no hay noticias asociadas a acciones colombianas con suficiente historico para medir impacto.")
+            else:
+                resumen_impacto_mostrable = formatear_tabla(
+                    resumen_impacto_noticias,
+                    fondo,
+                    [
+                        "Noticias",
+                        "Retorno +1 sesiones %",
+                        "Retorno +3 sesiones %",
+                        "Retorno +5 sesiones %",
+                        "Noticias positivas +1 sesiones %",
+                        "Noticias positivas +3 sesiones %",
+                        "Noticias positivas +5 sesiones %",
+                    ],
+                )
+                st.dataframe(resumen_impacto_mostrable, width="stretch", hide_index=True)
+                st.altair_chart(
+                    grafico_impacto_promedio(resumen_impacto_noticias),
+                    width="stretch",
+                )
+            if not impacto_noticias.empty:
+                st.subheader("Distribucion de retornos posteriores")
+                st.altair_chart(
+                    grafico_distribucion_impacto(impacto_noticias),
+                    width="stretch",
+                )
+                st.subheader("Detalle por noticia")
+                detalle_impacto = impacto_noticias.copy()
+                detalle_impacto["Fecha post"] = detalle_impacto["Fecha post"].dt.strftime("%Y-%m-%d %H:%M")
+                detalle_impacto["Fecha evento"] = detalle_impacto["Fecha evento"].dt.strftime("%Y-%m-%d")
+                detalle_impacto = formatear_tabla(
+                    detalle_impacto,
+                    fondo,
+                    [
+                        "Precio evento",
+                        "Retorno previo 1 sesiones %",
+                        "Retorno previo 3 sesiones %",
+                        "Retorno previo 5 sesiones %",
+                        "Retorno +1 sesiones %",
+                        "Retorno +3 sesiones %",
+                        "Retorno +5 sesiones %",
+                    ],
+                )
+                st.dataframe(detalle_impacto, width="stretch", hide_index=True)
             posts_mostrables = posts_x.copy()
             posts_mostrables["Fecha"] = posts_mostrables["Fecha"].dt.strftime("%Y-%m-%d %H:%M")
             posts_mostrables = formatear_tabla(
