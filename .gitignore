@@ -3,3 +3,4 @@ x_posts_cache.csv
 venv/
 __pycache__/
 *.pyc
+*.log

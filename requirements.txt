@@ -1,6 +1,0 @@
-altair
-pandas
-requests
-streamlit
-yfinance
-openpyxl

@@ -83,9 +83,12 @@ def grafico_real_vs_estimado(df):
 
 def grafico_correlaciones(df, columnas):
     labels = {
-        "precio_celsia":       "Celsia (COP)",
-        "precio_brent":        "Brent (USD)",
-        "precio_bolsa_energia":"Bolsa Energía (COP/MWh)",
+        "precio_celsia": "Celsia (COP)",
+        "precio_bolsa_energia": "Bolsa Energia (COP/kWh)",
+        "demanda_energia": "Demanda SIN (kWh)",
+        "embalse_util_pct": "Embalses (%)",
+        "aportes_pct": "Aportes (%)",
+        "trm_usd_cop": "TRM USD/COP",
     }
     corr = df[columnas].rename(columns=labels).corr()
     corr_long = corr.reset_index().melt("index")
@@ -104,3 +107,31 @@ def grafico_correlaciones(df, columnas):
         )
         .properties(height=220, title="Matriz de correlaciones de Pearson")
     )
+
+
+def grafico_rezagos(df, titulo):
+    """Grafico de correlacion por rezago temporal."""
+    base = alt.Chart(df).encode(
+        x=alt.X("rezago_dias:Q", title="Rezago futuro (dias)"),
+        y=alt.Y(
+            "correlacion:Q",
+            title="Correlacion de retornos",
+            scale=alt.Scale(domain=[-1, 1]),
+        ),
+        tooltip=[
+            alt.Tooltip("rezago_dias:Q", title="Dias", format=".0f"),
+            alt.Tooltip("correlacion:Q", title="r", format=".3f"),
+            alt.Tooltip("r2:Q", title="R2", format=".3f"),
+            alt.Tooltip("n:Q", title="Registros", format=".0f"),
+        ],
+    )
+
+    linea = base.mark_line(strokeWidth=2.5, color="#2563eb")
+    puntos = base.mark_circle(size=55, color="#0f766e")
+    cero = (
+        alt.Chart(pd.DataFrame({"y": [0]}))
+        .mark_rule(color="#64748b", strokeDash=[4, 3])
+        .encode(y="y:Q")
+    )
+
+    return (linea + puntos + cero).properties(height=320, title=titulo)

@@ -1,17 +1,20 @@
 import streamlit as st
 
+
 st.set_page_config(
-    page_title="Celsia — Regresión Bursátil",
+    page_title="Celsia - Modelo diario",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ Celsia S.A. E.S.P. — Análisis de Regresión")
+st.title("Celsia S.A. E.S.P. - Modelo diario de regresion")
 
 st.markdown("""
-**Asignatura:** Introducción a Inteligencia Artificial
-**Entrega:** Cuarta nota — Regresión lineal
-**Acción:** Celsia (BVC: CELSIA | Yahoo Finance: CELSIA.CL)
+**Asignatura:** Introduccion a Inteligencia Artificial
+
+**Entrega:** Regresion lineal
+
+**Accion:** Celsia (BVC: CELSIA | Yahoo Finance: CELSIA.CL)
 """)
 
 st.divider()
@@ -19,30 +22,33 @@ st.divider()
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("¿Qué analiza este dashboard?")
+    st.subheader("Que analiza este dashboard")
     st.markdown("""
-    Se identificaron **dos variables regresoras** que explican
-    el comportamiento del precio de la acción de Celsia en COP:
-    **Variable 1 — Precio de bolsa de energía (COP/MWh)**
-    Celsia genera y vende energía eléctrica al precio de bolsa
-    del mercado colombiano. Cuando ese precio sube, los ingresos
-    de Celsia suben → precio de la acción tiende a subir.
-    **Variable 2 — Precio del petróleo Brent (USD/barril)**
-    El Brent es la referencia global de energía. Cuando sube,
-    la energía renovable (que ofrece Celsia) se vuelve más
-    competitiva → atrae inversión → acción sube.
+    El modelo diario explica el precio de la accion de Celsia usando variables
+    observadas cada dia y relacionadas directamente con el mercado electrico
+    colombiano:
+
+    - Precio de bolsa de energia
+    - Demanda diaria del SIN
+    - Volumen util de embalses
+    - Aportes hidricos
+    - TRM USD/COP
+
+    Se descarta Brent como variable principal porque su relacion con Celsia es
+    indirecta y mostro baja capacidad explicativa en el analisis inicial.
     """)
 
 with col2:
-    st.subheader("Páginas del dashboard")
+    st.subheader("Paginas del dashboard")
     st.markdown("""
-    | Página | Contenido |
+    | Pagina | Contenido |
     |--------|-----------|
-    | 📊 **analisis** | EDA: explorar y visualizar los datos |
-    | 📈 **reportes** | Regresión: correlaciones y modelo |
+    | **analisis** | EDA: explorar y visualizar los datos diarios |
+    | **reportes** | Regresion, modelo multiple y rezagos temporales |
     """)
+
     st.divider()
     st.subheader("Fuentes de datos")
-    st.info("**CELSIA.CL** → Yahoo Finance via `yfinance` — gratis, sin registro")
-    st.info("**Bolsa energía** → API pública XM (`servapibi.xm.com.co`) — gratis, sin registro")
-    st.info("**Brent (BZ=F)** → Yahoo Finance via `yfinance` — gratis, sin registro")
+    st.info("**CELSIA.CL**: Yahoo Finance via `yfinance`")
+    st.info("**TRM USD/COP**: Yahoo Finance via `USDCOP=X`")
+    st.info("**XM**: API publica `servapibi.xm.com.co` para energia, demanda, embalses y aportes")
